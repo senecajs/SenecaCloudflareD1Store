@@ -1,207 +1,185 @@
 /* Copyright (c) 2024 Seneca contributors, MIT License */
 
-import { AwsSigv4Signer } from '@opensearch-project/opensearch/aws'
-import { Client } from '@opensearch-project/opensearch'
-import { defaultProvider } from '@aws-sdk/credential-provider-node'
-
 import { Gubu } from 'gubu'
 
-const { Open, Any } = Gubu
+const { Open, Any, Skip } = Gubu
+
+type D1Config = {
+  accountId: string
+  apiToken: string
+  databaseId: string
+  baseUrl: string
+}
 
 type Options = {
   debug: boolean
   map?: any
-  index: {
-    prefix: string
-    suffix: string
-    map: Record<string, string>
-    exact: string
-  }
-  field: {
-    zone: { name: string }
-    base: { name: string }
-    name: { name: string }
-    vector: { name: string }
-  }
+  generate_id?: (ent: any) => string
   cmd: {
     list: {
       size: number
+      maxScan: number
     }
   }
-  aws: any
-  opensearch: any
+  d1: any
 }
 
-export type OpensearchStoreOptions = Partial<Options>
+export type CloudflareD1StoreOptions = Partial<Options>
 
-function OpensearchStore(this: any, options: Options) {
+// Minimal D1 client abstraction — satisfied by binding adapter or REST client.
+type D1Client = {
+  query<T = any>(sql: string, params?: any[]): Promise<T[]>
+  run(sql: string, params?: any[]): Promise<void>
+}
+
+function CloudflareD1Store(this: any, options: Options) {
   const seneca: any = this
 
   const init = seneca.export('entity/init')
+  const generate_id: (ent: any) => string =
+    options.generate_id || seneca.export('entity/generate_id')
 
-  let desc: any = 'OpensearchStore'
+  let desc: any = 'CloudflareD1Store'
+  let client: D1Client
 
-  let client: any
+  // Track tables that have been ensured to exist in this session.
+  const knownTables = new Set<string>()
+
+  async function ensureTable(table: string) {
+    if (knownTables.has(table)) return
+    await client.run(
+      `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, data TEXT NOT NULL)`,
+    )
+    knownTables.add(table)
+  }
 
   let store = {
-    name: 'OpensearchStore',
+    name: 'CloudflareD1Store',
 
-    save: function (this: any, msg: any, reply: any) {
-      // const seneca = this
+    save: async function (this: any, msg: any, reply: any) {
       const ent = msg.ent
+      const id = '' + (ent.id || ent.id$ || generate_id(ent))
+      const d = ent.data$(false)
+      d.id = id
 
-      const canon = ent.canon$({ object: true })
-      const index = resolveIndex(ent, options)
+      const table = entityTable(ent)
 
-      const body = ent.data$(false)
-
-      const fieldOpts: any = options.field
-
-      ;['zone', 'base', 'name'].forEach((n: string) => {
-        if ('' != fieldOpts[n].name && null != canon[n] && '' != canon[n]) {
-          body[fieldOpts[n].name] = canon[n]
-        }
-      })
-
-      const req = {
-        index,
-        body,
-      }
-
-      client
-        .index(req)
-        .then((res: any) => {
-          const body = res.body
-          ent.data$(body._source)
-          ent.id = body._id
-          reply(ent)
-        })
-        .catch((err: any) => reply(err))
-    },
-
-    load: function (this: any, msg: any, reply: any) {
-      // const seneca = this
-      const ent = msg.ent
-
-      // const canon = ent.canon$({ object: true })
-      const index = resolveIndex(ent, options)
-
-      let q = msg.q || {}
-
-      if (null != q.id) {
-        client
-          .get({
-            index,
-            id: q.id,
-          })
-          .then((res: any) => {
-            const body = res.body
-            ent.data$(body._source)
-            ent.id = body._id
-            reply(ent)
-          })
-          .catch((err: any) => {
-            // Not found
-            if (err.meta && 404 === err.meta.statusCode) {
-              reply(null)
-            }
-
-            reply(err)
-          })
-      } else {
-        reply()
+      try {
+        await ensureTable(table)
+        await client.run(
+          `INSERT OR REPLACE INTO ${table} (id, data) VALUES (?, ?)`,
+          [id, JSON.stringify(d)],
+        )
+        const ento = ent.make$().data$(d)
+        reply(null, ento)
+      } catch (err: any) {
+        reply(err)
       }
     },
 
-    list: function (msg: any, reply: any) {
-      // const seneca = this
-      const ent = msg.ent
-
-      const index = resolveIndex(ent, options)
-      const query = buildQuery({ index, options, msg })
-
-      // console.log('LISTQ')
-      // console.dir(query, { depth: null })
-
-      if (null == query) {
-        return reply([])
-      }
-
-      client
-        .search(query)
-        .then((res: any) => {
-          const hits = res.body.hits
-          const list = hits.hits.map((entry: any) => {
-            let item = ent.make$().data$(entry._source)
-            item.id = entry._id
-            item.custom$ = { score: entry._score }
-            return item
-          })
-          reply(list)
-        })
-        .catch((err: any) => {
-          reply(err)
-        })
-    },
-
-    // NOTE: all$:true is REQUIRED for deleteByQuery
-    remove: function (this: any, msg: any, reply: any) {
-      // const seneca = this
-      const ent = msg.ent
-
-      const index = resolveIndex(ent, options)
-
+    load: async function (this: any, msg: any, reply: any) {
+      const qent = msg.qent
       const q = msg.q || {}
-      let id = q.id
-      let query
+      const table = entityTable(qent)
 
-      if (null == id) {
-        query = buildQuery({ index, options, msg })
+      try {
+        await ensureTable(table)
 
-        if (null == query || true !== q.all$) {
+        let rows: any[]
+
+        if (null != q.id) {
+          rows = await client.query(
+            `SELECT data FROM ${table} WHERE id = ?`,
+            ['' + q.id],
+          )
+        } else {
+          const { where, params } = buildWhere(q)
+          const sql = `SELECT data FROM ${table}${where} LIMIT 1`
+          rows = await client.query(sql, params)
+        }
+
+        if (0 === rows.length) {
           return reply(null)
         }
+
+        const entdata = JSON.parse(rows[0].data)
+        const ento = qent.make$().data$(entdata)
+        reply(null, ento)
+      } catch (err: any) {
+        reply(err)
       }
+    },
 
-      // console.log('REMOVE', id)
-      // console.dir(query, { depth: null })
+    list: async function (this: any, msg: any, reply: any) {
+      const qent = msg.qent
+      const q = msg.q || {}
+      const table = entityTable(qent)
 
-      if (null != id) {
-        client
-          .delete({
-            index,
-            id,
-            // refresh: true,
-          })
-          .then((_res: any) => {
-            reply(null)
-          })
-          .catch((err: any) => {
-            // Not found
-            if (err.meta && 404 === err.meta.statusCode) {
-              return reply(null)
+      try {
+        await ensureTable(table)
+
+        const { where, params } = buildWhere(q)
+        const order = buildOrder(q)
+        const size = options.cmd.list.size
+        const limit = null == q.limit$ ? size : q.limit$
+        const offset = q.skip$ || 0
+
+        const sql = `SELECT data FROM ${table}${where}${order} LIMIT ? OFFSET ?`
+        const rows = await client.query(sql, [...params, limit, offset])
+
+        let list = rows.map((row: any) => {
+          const entdata = JSON.parse(row.data)
+          return qent.make$().data$(entdata)
+        })
+
+        if (Array.isArray(q.fields$)) {
+          list = list.map((ento: any) => {
+            const picked: any = { id: ento.id }
+            for (const f of q.fields$) {
+              picked[f] = ento[f]
             }
+            return qent.make$().data$(picked)
+          })
+        }
 
-            reply(err)
-          })
-      } else if (null != query && true === q.all$) {
-        client
-          .deleteByQuery({
-            index,
-            body: {
-              query,
-            },
-            // refresh: true,
-          })
-          .then((_res: any) => {
-            reply(null)
-          })
-          .catch((err: any) => {
-            // console.log('REM ERR', err)
-            reply(err)
-          })
-      } else {
-        reply(null)
+        reply(null, list)
+      } catch (err: any) {
+        reply(err)
+      }
+    },
+
+    remove: async function (this: any, msg: any, reply: any) {
+      const qent = msg.qent
+      const q = msg.q || {}
+      const table = entityTable(qent)
+      const all = true === q.all$
+
+      try {
+        await ensureTable(table)
+
+        if (null != q.id) {
+          await client.run(`DELETE FROM ${table} WHERE id = ?`, ['' + q.id])
+          return reply()
+        }
+
+        if (all) {
+          const { where, params } = buildWhere(q)
+          await client.run(`DELETE FROM ${table}${where}`, params)
+          return reply()
+        }
+
+        // Remove first match
+        const { where, params } = buildWhere(q)
+        const rows = await client.query(
+          `SELECT id FROM ${table}${where} LIMIT 1`,
+          params,
+        )
+        if (rows.length > 0) {
+          await client.run(`DELETE FROM ${table} WHERE id = ?`, [rows[0].id])
+        }
+        reply()
+      } catch (err: any) {
+        reply(err)
       }
     },
 
@@ -210,11 +188,8 @@ function OpensearchStore(this: any, options: Options) {
       reply()
     },
 
-    // TODO: obsolete - remove from seneca entity
     native: function (this: any, _msg: any, reply: any) {
-      reply(null, {
-        client: () => client,
-      })
+      reply(null, { client: () => client })
     },
   }
 
@@ -222,157 +197,136 @@ function OpensearchStore(this: any, options: Options) {
 
   desc = meta.desc
 
-  seneca.prepare(async function (this: any) {
-    const region = options.aws.region
-    const node = options.opensearch.node
-
-    client = new Client({
-      ...AwsSigv4Signer({
-        region,
-        service: 'aoss',
-        getCredentials: () => {
-          const credentialsProvider = defaultProvider()
-          return credentialsProvider()
-        },
-      }),
-      node,
-    })
-  })
+  seneca.add(
+    { init: store.name, tag: meta.tag },
+    function (this: any, _msg: any, reply: any) {
+      client = options.d1?.binding
+        ? makeBindingClient(options.d1.binding)
+        : makeRestClient(options.d1 as D1Config)
+      reply()
+    },
+  )
 
   return {
     name: store.name,
     tag: meta.tag,
-    exportmap: {
-      native: () => {
-        return { client }
-      },
+    exports: {
+      native: () => ({ client }),
     },
   }
 }
 
-function buildQuery(spec: { index: string; options: any; msg: any }) {
-  const { index, options, msg } = spec
+// Derives a safe SQL table name from an entity canon.
+function entityTable(ent: any): string {
+  const canon = ent.canon$({ object: true })
+  const base = canon.base && '-' !== canon.base ? canon.base + '_' : ''
+  return base + canon.name
+}
 
-  const q = msg.q || {}
+// Builds a SQL WHERE clause from a Seneca query object.
+function buildWhere(q: any): { where: string; params: any[] } {
+  const conditions: string[] = []
+  const params: any[] = []
 
-  let query: any = {
-    index,
-    body: {
-      size: msg.size$ || options.cmd.list.size,
-      _source: {
-        excludes: [options.field.vector.name].filter((n) => '' !== n),
-      },
-      query: {},
+  for (const [key, val] of Object.entries(q)) {
+    if (key.endsWith('$') || null == val) continue
+    conditions.push(`json_extract(data, '$.${key}') = ?`)
+    params.push(val)
+  }
+
+  const where =
+    conditions.length > 0 ? ' WHERE ' + conditions.join(' AND ') : ''
+  return { where, params }
+}
+
+// Builds a SQL ORDER BY clause from q.sort$.
+function buildOrder(q: any): string {
+  if (!q.sort$ || 'object' !== typeof q.sort$) return ''
+  const parts = Object.entries(q.sort$).map(([field, dir]) => {
+    return `json_extract(data, '$.${field}') ${(dir as number) < 0 ? 'DESC' : 'ASC'}`
+  })
+  return parts.length > 0 ? ' ORDER BY ' + parts.join(', ') : ''
+}
+
+// Adapter for a Cloudflare D1Database Workers binding.
+function makeBindingClient(binding: any): D1Client {
+  return {
+    async query(sql, params = []) {
+      const stmt = binding.prepare(sql).bind(...params)
+      const result = await stmt.all()
+      return result.results
+    },
+    async run(sql, params = []) {
+      await binding.prepare(sql).bind(...params).run()
     },
   }
+}
 
-  let excludeKeys: any = { vector: 1 }
-
-  const parts = []
-
-  for (let k in q) {
-    if (!excludeKeys[k] && !k.match(/\$/)) {
-      parts.push({
-        match: { [k]: q[k] },
-      })
-    }
+// REST client for Cloudflare D1 HTTP API, for use outside a Worker.
+function makeRestClient(cf: D1Config): D1Client {
+  const base = `${cf.baseUrl}/accounts/${cf.accountId}/d1/database/${cf.databaseId}`
+  const headers = {
+    Authorization: `Bearer ${cf.apiToken}`,
+    'Content-Type': 'application/json',
   }
 
-  const vector$ = msg.vector$ || q.directive$?.vector$
-  if (vector$) {
-    parts.push({
-      knn: {
-        vector: {
-          vector: q.vector,
-          k: null == vector$.k ? 11 : vector$.k,
-        },
-      },
+  async function exec(sql: string, params: any[] = []) {
+    const res = await fetch(`${base}/query`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ sql, params }),
     })
-  }
 
-  if (0 === parts.length) {
-    query = null
-  } else if (1 === parts.length) {
-    query.body.query = parts[0]
-  } else {
-    query.body.query = {
-      bool: {
-        must: parts,
-      },
+    if (!res.ok) {
+      throw new Error('CloudflareD1Store: query failed: ' + res.status)
     }
+
+    const body: any = await res.json()
+
+    if (!body.success) {
+      throw new Error(
+        'CloudflareD1Store: query error: ' + JSON.stringify(body.errors),
+      )
+    }
+
+    return body.result[0].results as any[]
   }
 
-  return query
+  return {
+    query: exec,
+    async run(sql, params = []) {
+      await exec(sql, params)
+    },
+  }
 }
 
-function resolveIndex(ent: any, options: Options) {
-  let indexOpts = options.index
-  if ('' != indexOpts.exact && null != indexOpts.exact) {
-    return indexOpts.exact
-  }
-
-  let canonstr = ent.canon$({ string: true })
-  indexOpts.map = indexOpts.map || {}
-  if ('' != indexOpts.map[canonstr] && null != indexOpts.map[canonstr]) {
-    return indexOpts.map[canonstr]
-  }
-
-  let prefix = indexOpts.prefix
-  let suffix = indexOpts.suffix
-
-  prefix = '' == prefix || null == prefix ? '' : prefix + '_'
-  suffix = '' == suffix || null == suffix ? '' : '_' + suffix
-
-  // TOOD: need ent.canon$({ external: true }) : foo/bar -> foo_bar
-  let infix = ent
-    .canon$({ string: true })
-    .replace(/-\//g, '')
-    .replace(/\//g, '_')
-
-  return prefix + infix + suffix
-}
-
-// Default options.
 const defaults: Options = {
   debug: false,
   map: Any(),
-  index: {
-    prefix: '',
-    suffix: '',
-    map: {},
-    exact: '',
-  },
-
-  // '' === name => do not inject
-  field: {
-    zone: { name: 'zone' },
-    base: { name: 'base' },
-    name: { name: 'name' },
-    vector: { name: 'vector' },
-  },
 
   cmd: {
     list: {
       size: 11,
+      maxScan: 1000,
     },
   },
 
-  aws: Open({
-    region: 'us-east-1',
-  }),
-
-  opensearch: Open({
-    node: 'NODE-URL',
+  d1: Open({
+    binding: Skip(Any()),
+    accountId: '',
+    apiToken: '',
+    databaseId: '',
+    baseUrl: 'https://api.cloudflare.com/client/v4',
   }),
 }
 
-Object.assign(OpensearchStore, {
+Object.assign(CloudflareD1Store, {
   defaults,
-  utils: { resolveIndex },
+  utils: { entityTable, buildWhere, makeRestClient, makeBindingClient },
 })
 
-export default OpensearchStore
+export default CloudflareD1Store
 
 if ('undefined' !== typeof module) {
-  module.exports = OpensearchStore
+  module.exports = CloudflareD1Store
 }

@@ -26,3 +26,4 @@ test/coverage.html
 
 .env.local
 coverage/
+dist/

@@ -58,20 +58,47 @@ function CloudflareD1Store(this: any, options: Options) {
 
     save: async function (this: any, msg: any, reply: any) {
       const ent = msg.ent
-      const id = '' + (ent.id || ent.id$ || generate_id(ent))
       const d = ent.data$(false)
-      d.id = id
-
       const table = entityTable(ent)
 
       try {
         await ensureTable(table)
+
+        // Update path (ent.id already identifies an existing row) vs.
+        // create path (ent.id$ or a freshly generated id) are genuinely
+        // different operations here, not just two ways to name the same
+        // one. seneca-entity's own idiomatic partial update —
+        // `entity.make$({id}).save$(patch)` — builds `ent` from just
+        // `{id}` plus whatever fields the caller actually touched; `d`
+        // above is *only* that partial set, never the full row. A plain
+        // `INSERT OR REPLACE` would silently drop every column the
+        // caller didn't mention, since this store keeps one JSON blob per
+        // row rather than real SQL columns a bare UPDATE could target
+        // individually. Load the existing blob first and merge on top of
+        // it — the same net effect a real column-store's
+        // `UPDATE ... SET col = val` gets for free.
+        if (null != ent.id) {
+          const id = '' + ent.id
+          const existingRows = await client.query(
+            `SELECT data FROM ${table} WHERE id = ?`,
+            [id],
+          )
+          const existing = existingRows.length ? JSON.parse(existingRows[0].data) : {}
+          const merged = { ...existing, ...d, id }
+          await client.run(
+            `INSERT OR REPLACE INTO ${table} (id, data) VALUES (?, ?)`,
+            [id, JSON.stringify(merged)],
+          )
+          return reply(null, ent.make$().data$(merged))
+        }
+
+        const id = '' + (ent.id$ || generate_id(ent))
+        d.id = id
         await client.run(
           `INSERT OR REPLACE INTO ${table} (id, data) VALUES (?, ?)`,
           [id, JSON.stringify(d)],
         )
-        const ento = ent.make$().data$(d)
-        reply(null, ento)
+        reply(null, ent.make$().data$(d))
       } catch (err: any) {
         reply(err)
       }

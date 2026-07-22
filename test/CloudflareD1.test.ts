@@ -186,6 +186,36 @@ describe('CloudflareD1Store', () => {
       const loaded = await seneca.entity('foo/bar').load$(ent.id)
       expect(loaded.x).toEqual(2)
     })
+
+    // Regression test: make$({id}).save$(patch) is seneca-entity's own
+    // idiom for a partial update — the entity instance passed to save$
+    // only ever carries {id, ...patch}, never the row's other fields. A
+    // save implementation that just re-serializes that instance (rather
+    // than merging onto the existing row first) silently drops every
+    // column the caller didn't name. Deliberately a *different* code path
+    // than the 'update existing entity' test above, which reuses the same
+    // in-memory entity instance across both save$ calls and so never
+    // exercises the partial-object case at all.
+    test('partial update via make$({id}).save$(patch) preserves untouched fields', async () => {
+      const created = await seneca
+        .entity('foo/partial')
+        .data$({ a: 1, b: 'keep-me', c: true })
+        .save$()
+
+      const updated = await seneca
+        .entity('foo/partial')
+        .make$({ id: created.id })
+        .save$({ a: 2 })
+
+      expect(updated.a).toEqual(2)
+      expect(updated.b).toEqual('keep-me')
+      expect(updated.c).toEqual(true)
+
+      const loaded = await seneca.entity('foo/partial').load$(created.id)
+      expect(loaded.a).toEqual(2)
+      expect(loaded.b).toEqual('keep-me')
+      expect(loaded.c).toEqual(true)
+    })
   })
 
   describe('makeRestClient', () => {

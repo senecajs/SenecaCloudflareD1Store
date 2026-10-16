@@ -1,6 +1,6 @@
 {
   "name": "@seneca/cloudflare-d1-store",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Seneca Cloudflare D1 Store data storage plugin.",
   "main": "dist/CloudflareD1Store.js",
   "type": "commonjs",
@@ -65,5 +65,12 @@
     "src",
     "dist"
   ],
-  "dependencies": {}
+  "dependencies": {},
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
 }

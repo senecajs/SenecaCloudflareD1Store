@@ -18,8 +18,10 @@ Unlike KV and R2, D1 supports full SQL queries — `list$` with field filtering,
 ## Install
 
 ```sh
-npm install @seneca/cloudflare-d1-store
+npm install seneca@^4 @seneca/entity @seneca/cloudflare-d1-store
 ```
+
+Needs Seneca 4, `@seneca/entity` 29 and Node.js 24 or later.
 
 ## Usage
 
@@ -31,7 +33,7 @@ Pass the `D1Database` binding from your Cloudflare Worker directly:
 import CloudflareD1Store from '@seneca/cloudflare-d1-store'
 
 seneca
-  .use('entity')
+  .use('@seneca/entity')
   .use(CloudflareD1Store, {
     d1: { binding: env.MY_DB },
   })
@@ -52,7 +54,7 @@ Use the Cloudflare D1 HTTP API with your account credentials:
 
 ```js
 seneca
-  .use('entity')
+  .use('@seneca/entity')
   .use(CloudflareD1Store, {
     d1: {
       accountId: 'your-account-id',
@@ -72,6 +74,7 @@ seneca
 | `d1.databaseId` | `''` | D1 database ID (for REST API) |
 | `d1.baseUrl` | `'https://api.cloudflare.com/client/v4'` | Cloudflare API base URL |
 | `cmd.list.size` | `11` | Default page size for `list$` |
+| `generate_id` | returns `undefined` | Function `(ent) => id` for new entities. When it returns `undefined`, the entity plugin generates the id |
 
 ## Table and key scheme
 
@@ -83,14 +86,15 @@ Each entity type maps to a SQL table derived from its canon:
 | `foo/bar` | `foo_bar` |
 | `zone/base/name` | `base_name` |
 
-Tables are created automatically on first use (`CREATE TABLE IF NOT EXISTS`). Each table has two columns: `id TEXT PRIMARY KEY` and `data TEXT` (the entity as JSON).
+Tables are created automatically on first use (`CREATE TABLE IF NOT EXISTS`). Each table has two columns: `id TEXT PRIMARY KEY` and `data TEXT` (the entity as JSON). A table name may contain only letters, digits and underscores; any other canon is an error.
 
 ## Querying
 
-`list$` translates query fields to SQL `WHERE` conditions using SQLite's `json_extract`:
+`list$` translates query fields to SQL `WHERE` conditions using SQLite's `json_extract`. Field names and values are bound parameters, never SQL text:
 
 ```js
-// SELECT data FROM foo_bar WHERE json_extract(data,'$.color') = 'red' ORDER BY ... LIMIT 11 OFFSET 0
+// SELECT data FROM "foo_bar" WHERE json_extract(data, ?) = ? ... LIMIT ? OFFSET ?
+// with the parameters '$.color', 'red', 11, 0
 const list = await seneca.entity('foo/bar').list$({ color: 'red' })
 
 // With sort, pagination and field projection
@@ -110,6 +114,10 @@ const { client } = seneca.export('CloudflareD1Store/native')()
 ```
 
 Returns the active `D1Client` instance (binding adapter or REST client).
+
+## Seneca compatibility
+
+Supports Seneca **4.x**, with `@seneca/entity` 29.x.
 
 ## License
 

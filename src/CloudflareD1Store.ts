@@ -1,9 +1,5 @@
 /* Copyright (c) 2024 Seneca contributors, MIT License */
 
-import { Gubu } from 'gubu'
-
-const { Open, Any, Skip } = Gubu
-
 type D1Config = {
   accountId: string
   apiToken: string
@@ -14,7 +10,7 @@ type D1Config = {
 type Options = {
   debug: boolean
   map?: any
-  generate_id?: (ent: any) => string
+  generate_id: (ent: any) => string | undefined
   cmd: {
     list: {
       size: number
@@ -36,8 +32,13 @@ function CloudflareD1Store(this: any, options: Options) {
   const seneca: any = this
 
   const init = seneca.export('entity/init')
-  const generate_id: (ent: any) => string =
-    options.generate_id || seneca.export('entity/generate_id')
+  const entity_generate_id: (ent: any) => string =
+    seneca.export('entity/generate_id')
+
+  // The default generate_id option returns undefined: use the generator of
+  // the entity plugin.
+  const generate_id = (ent: any): string =>
+    options.generate_id(ent) ?? entity_generate_id(ent)
 
   let desc: any = 'CloudflareD1Store'
   let client: D1Client
@@ -48,7 +49,7 @@ function CloudflareD1Store(this: any, options: Options) {
   async function ensureTable(table: string) {
     if (knownTables.has(table)) return
     await client.run(
-      `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, data TEXT NOT NULL)`,
+      `CREATE TABLE IF NOT EXISTS "${table}" (id TEXT PRIMARY KEY, data TEXT NOT NULL)`,
     )
     knownTables.add(table)
   }
@@ -58,10 +59,10 @@ function CloudflareD1Store(this: any, options: Options) {
 
     save: async function (this: any, msg: any, reply: any) {
       const ent = msg.ent
-      const d = ent.data$(false)
-      const table = entityTable(ent)
 
       try {
+        const d = ent.data$(false)
+        const table = entityTable(ent)
         await ensureTable(table)
 
         // Update path (ent.id already identifies an existing row) vs.
@@ -80,13 +81,13 @@ function CloudflareD1Store(this: any, options: Options) {
         if (null != ent.id) {
           const id = '' + ent.id
           const existingRows = await client.query(
-            `SELECT data FROM ${table} WHERE id = ?`,
+            `SELECT data FROM "${table}" WHERE id = ?`,
             [id],
           )
           const existing = existingRows.length ? JSON.parse(existingRows[0].data) : {}
           const merged = { ...existing, ...d, id }
           await client.run(
-            `INSERT OR REPLACE INTO ${table} (id, data) VALUES (?, ?)`,
+            `INSERT OR REPLACE INTO "${table}" (id, data) VALUES (?, ?)`,
             [id, JSON.stringify(merged)],
           )
           return reply(null, ent.make$().data$(merged))
@@ -95,7 +96,7 @@ function CloudflareD1Store(this: any, options: Options) {
         const id = '' + (ent.id$ || generate_id(ent))
         d.id = id
         await client.run(
-          `INSERT OR REPLACE INTO ${table} (id, data) VALUES (?, ?)`,
+          `INSERT OR REPLACE INTO "${table}" (id, data) VALUES (?, ?)`,
           [id, JSON.stringify(d)],
         )
         reply(null, ent.make$().data$(d))
@@ -107,21 +108,21 @@ function CloudflareD1Store(this: any, options: Options) {
     load: async function (this: any, msg: any, reply: any) {
       const qent = msg.qent
       const q = msg.q || {}
-      const table = entityTable(qent)
 
       try {
+        const table = entityTable(qent)
         await ensureTable(table)
 
         let rows: any[]
 
         if (null != q.id) {
           rows = await client.query(
-            `SELECT data FROM ${table} WHERE id = ?`,
+            `SELECT data FROM "${table}" WHERE id = ?`,
             ['' + q.id],
           )
         } else {
           const { where, params } = buildWhere(q)
-          const sql = `SELECT data FROM ${table}${where} LIMIT 1`
+          const sql = `SELECT data FROM "${table}"${where} LIMIT 1`
           rows = await client.query(sql, params)
         }
 
@@ -140,19 +141,24 @@ function CloudflareD1Store(this: any, options: Options) {
     list: async function (this: any, msg: any, reply: any) {
       const qent = msg.qent
       const q = msg.q || {}
-      const table = entityTable(qent)
 
       try {
+        const table = entityTable(qent)
         await ensureTable(table)
 
         const { where, params } = buildWhere(q)
-        const order = buildOrder(q)
+        const { order, params: orderParams } = buildOrder(q)
         const size = options.cmd.list.size
         const limit = null == q.limit$ ? size : q.limit$
         const offset = q.skip$ || 0
 
-        const sql = `SELECT data FROM ${table}${where}${order} LIMIT ? OFFSET ?`
-        const rows = await client.query(sql, [...params, limit, offset])
+        const sql = `SELECT data FROM "${table}"${where}${order} LIMIT ? OFFSET ?`
+        const rows = await client.query(sql, [
+          ...params,
+          ...orderParams,
+          limit,
+          offset,
+        ])
 
         let list = rows.map((row: any) => {
           const entdata = JSON.parse(row.data)
@@ -178,31 +184,31 @@ function CloudflareD1Store(this: any, options: Options) {
     remove: async function (this: any, msg: any, reply: any) {
       const qent = msg.qent
       const q = msg.q || {}
-      const table = entityTable(qent)
       const all = true === q.all$
 
       try {
+        const table = entityTable(qent)
         await ensureTable(table)
 
         if (null != q.id) {
-          await client.run(`DELETE FROM ${table} WHERE id = ?`, ['' + q.id])
+          await client.run(`DELETE FROM "${table}" WHERE id = ?`, ['' + q.id])
           return reply()
         }
 
         if (all) {
           const { where, params } = buildWhere(q)
-          await client.run(`DELETE FROM ${table}${where}`, params)
+          await client.run(`DELETE FROM "${table}"${where}`, params)
           return reply()
         }
 
         // Remove first match
         const { where, params } = buildWhere(q)
         const rows = await client.query(
-          `SELECT id FROM ${table}${where} LIMIT 1`,
+          `SELECT id FROM "${table}"${where} LIMIT 1`,
           params,
         )
         if (rows.length > 0) {
-          await client.run(`DELETE FROM ${table} WHERE id = ?`, [rows[0].id])
+          await client.run(`DELETE FROM "${table}" WHERE id = ?`, [rows[0].id])
         }
         reply()
       } catch (err: any) {
@@ -224,15 +230,12 @@ function CloudflareD1Store(this: any, options: Options) {
 
   desc = meta.desc
 
-  seneca.add(
-    { init: store.name, tag: meta.tag },
-    function (this: any, _msg: any, reply: any) {
-      client = options.d1?.binding
-        ? makeBindingClient(options.d1.binding)
-        : makeRestClient(options.d1 as D1Config)
-      reply()
-    },
-  )
+  seneca.init(function (this: any, reply: any) {
+    client = options.d1?.binding
+      ? makeBindingClient(options.d1.binding)
+      : makeRestClient(options.d1 as D1Config)
+    reply()
+  })
 
   return {
     name: store.name,
@@ -243,22 +246,37 @@ function CloudflareD1Store(this: any, options: Options) {
   }
 }
 
+// Table names: letters, digits and underscores only, so that an entity
+// canon can never change the SQL text. The SQL quotes the name, so SQL
+// keywords such as `order` also work as entity names.
+const TABLE_NAME_RE = /^[A-Za-z0-9_]+$/
+
 // Derives a safe SQL table name from an entity canon.
 function entityTable(ent: any): string {
   const canon = ent.canon$({ object: true })
   const base = canon.base && '-' !== canon.base ? canon.base + '_' : ''
-  return base + canon.name
+  const table = base + canon.name
+  if (!TABLE_NAME_RE.test(table)) {
+    throw new Error(
+      'CloudflareD1Store: invalid table name ' +
+        JSON.stringify(table) +
+        ' (entity canon base and name may contain only letters,' +
+        ' digits and underscores)',
+    )
+  }
+  return table
 }
 
-// Builds a SQL WHERE clause from a Seneca query object.
+// Builds a SQL WHERE clause from a Seneca query object. Field names reach
+// SQLite as bound JSON path parameters, never as SQL text.
 function buildWhere(q: any): { where: string; params: any[] } {
   const conditions: string[] = []
   const params: any[] = []
 
   for (const [key, val] of Object.entries(q)) {
     if (key.endsWith('$') || null == val) continue
-    conditions.push(`json_extract(data, '$.${key}') = ?`)
-    params.push(val)
+    conditions.push('json_extract(data, ?) = ?')
+    params.push('$.' + key, val)
   }
 
   const where =
@@ -266,13 +284,19 @@ function buildWhere(q: any): { where: string; params: any[] } {
   return { where, params }
 }
 
-// Builds a SQL ORDER BY clause from q.sort$.
-function buildOrder(q: any): string {
-  if (!q.sort$ || 'object' !== typeof q.sort$) return ''
+// Builds a SQL ORDER BY clause from q.sort$, with the field names as bound
+// JSON path parameters.
+function buildOrder(q: any): { order: string; params: any[] } {
+  const params: any[] = []
+  if (!q.sort$ || 'object' !== typeof q.sort$) return { order: '', params }
   const parts = Object.entries(q.sort$).map(([field, dir]) => {
-    return `json_extract(data, '$.${field}') ${(dir as number) < 0 ? 'DESC' : 'ASC'}`
+    params.push('$.' + field)
+    return `json_extract(data, ?) ${(dir as number) < 0 ? 'DESC' : 'ASC'}`
   })
-  return parts.length > 0 ? ' ORDER BY ' + parts.join(', ') : ''
+  return {
+    order: parts.length > 0 ? ' ORDER BY ' + parts.join(', ') : '',
+    params,
+  }
 }
 
 // Adapter for a Cloudflare D1Database Workers binding.
@@ -327,9 +351,16 @@ function makeRestClient(cf: D1Config): D1Client {
   }
 }
 
-const defaults: Options = {
+// The option shape is built with the builders that Seneca passes in
+// `valid`. Seneca 4 rejects defaults built with Gubu.
+const defaults = ({ valid }: { valid: any }) => ({
   debug: false,
-  map: Any(),
+  map: valid.Any(),
+
+  // Returns undefined to use the id generator of the entity plugin.
+  generate_id: function generate_id(_ent: any): string | undefined {
+    return undefined
+  },
 
   cmd: {
     list: {
@@ -338,18 +369,24 @@ const defaults: Options = {
     },
   },
 
-  d1: Open({
-    binding: Skip(Any()),
+  d1: valid.Open({
+    binding: valid.Skip(valid.Any()),
     accountId: '',
     apiToken: '',
     databaseId: '',
     baseUrl: 'https://api.cloudflare.com/client/v4',
   }),
-}
+})
 
 Object.assign(CloudflareD1Store, {
   defaults,
-  utils: { entityTable, buildWhere, makeRestClient, makeBindingClient },
+  utils: {
+    entityTable,
+    buildWhere,
+    buildOrder,
+    makeRestClient,
+    makeBindingClient,
+  },
 })
 
 export default CloudflareD1Store
